@@ -11,15 +11,23 @@ from openpyxl.utils import get_column_letter
 
 
 def extract_urls_from_stdout(stdout_text):
-    """从标准输出中提取http/https URL"""
+    """仅从可信的扫描结果行中提取http/https URL"""
     if not stdout_text:
         return []
 
-    urls = re.findall(r'https?://\S+', stdout_text)
     cleaned_urls = []
-    for url in urls:
-        cleaned_url = re.sub(r'[,\]\)\]>]+$', '', url)
-        cleaned_urls.append(cleaned_url)
+    for raw_line in stdout_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if 'TCP/HTTP' not in line and 'TCP/HTTPS' not in line:
+            continue
+
+        url_matches = re.findall(r'https?://\S+', line)
+        for url in url_matches:
+            cleaned_url = re.sub(r'[,\]\)\]>]+$', '', url)
+            cleaned_urls.append(cleaned_url)
 
     return list(dict.fromkeys(cleaned_urls))
 
