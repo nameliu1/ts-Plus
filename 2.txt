@@ -114,6 +114,61 @@ def write_url_file_from_stdout_if_needed(extracted_urls, before_state, after_sta
 
 
 
+def build_seed_urls_from_ip_file(file_path="ip.txt"):
+    """当扫描未产出URL时，从ip.txt回填基础资产URL"""
+    if not os.path.exists(file_path):
+        return []
+
+    seed_urls = []
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            for target in line.split(","):
+                target = target.strip()
+                if not target:
+                    continue
+
+                if target.startswith(("http://", "https://")):
+                    seed_urls.append(target)
+                    continue
+
+                if "/" in target or "-" in target or target.count(":") > 1:
+                    continue
+
+                seed_urls.append(f"https://{target}")
+                seed_urls.append(f"http://{target}")
+
+    return list(dict.fromkeys(seed_urls))
+
+
+
+def write_url_file_from_ip_file_if_needed(before_state, after_state, ip_file="ip.txt"):
+    """当扫描未生成URL且stdout无可信结果时，从ip.txt回填基础URL"""
+    file_updated_this_run = url_file_was_updated_this_run(before_state, after_state)
+    fresh_non_empty_url_file = file_updated_this_run and is_non_empty_url_file(after_state)
+    if fresh_non_empty_url_file:
+        return False
+
+    seed_urls = build_seed_urls_from_ip_file(ip_file)
+    if not seed_urls:
+        print("ip.txt中没有可回填到url.txt的基础资产")
+        return False
+
+    try:
+        with open("url.txt", "w", encoding="utf-8") as f:
+            for url in seed_urls:
+                f.write(url + "\n")
+        print(f"扫描阶段未产出URL，已根据ip.txt回填url.txt，共写入 {len(seed_urls)} 条基础URL")
+        return True
+    except Exception as e:
+        print(f"根据ip.txt回填url.txt失败: {e}")
+        return False
+
+
+
 def run_ts_scan():
     """执行ts命令进行扫描，实时回显并收集输出"""
     print("开始执行端口扫描...")
@@ -454,11 +509,19 @@ def main():
         scan_result['url_file_before'],
         scan_result['url_file_after'],
     )
+    ip_seed_written = False
+    if not fresh_url_file and not fallback_written:
+        ip_seed_written = write_url_file_from_ip_file_if_needed(
+            scan_result['url_file_before'],
+            scan_result['url_file_after'],
+        )
 
     if fresh_url_file:
         print("扫描完成，本次扫描已生成新的非空url.txt")
     elif fallback_written:
         print("扫描完成，本次扫描未生成新的非空url.txt，已根据stdout补写url.txt")
+    elif ip_seed_written:
+        print("扫描完成，ts未产出URL，已根据ip.txt补写基础url.txt")
     else:
         print("扫描完成，但本次扫描未生成可用的url.txt")
         sys.exit(1)
