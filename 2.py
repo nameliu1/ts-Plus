@@ -21,7 +21,7 @@ def extract_urls_from_stdout(stdout_text):
         if not line:
             continue
 
-        if 'TCP/HTTP' not in line and 'TCP/HTTPS' not in line:
+        if '/HTTP' not in line:
             continue
 
         url_matches = re.findall(r'https?://\S+', line)
