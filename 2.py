@@ -25,6 +25,13 @@ def extract_urls_from_stdout(stdout_text):
 
 
 
+def reset_url_file(file_path="url.txt"):
+    """每次扫描前重建url.txt，避免沿用旧结果"""
+    with open(file_path, "w", encoding="utf-8"):
+        pass
+
+
+
 def snapshot_url_file_state(file_path="url.txt"):
     """记录url.txt在扫描前后的存在性、修改时间和大小"""
     if not os.path.exists(file_path):
@@ -102,6 +109,8 @@ def write_url_file_from_stdout_if_needed(extracted_urls, before_state, after_sta
 def run_ts_scan():
     """执行ts命令进行扫描，实时回显并收集输出"""
     print("开始执行端口扫描...")
+    reset_url_file()
+    print("已重建url.txt并清空旧内容")
     cmd = 'ts -hf ip.txt -pa 3389 -np -m port,url'
     url_file_before = snapshot_url_file_state()
     output_chunks = []
