@@ -3,6 +3,7 @@ import time
 import datetime
 import sys
 import json
+import locale
 import psutil
 import subprocess
 import shutil
@@ -27,6 +28,7 @@ STATUS_CODE_COL_INDEX = 9  # 兼容旧格式的J列索引
 URL_COL_INDEX = 4  # 兼容旧格式的E列索引
 STATUS_CODE_CANDIDATES = ["status", "状态码", "status_code", "code", "Status", "STATUS", "J"]
 URL_CANDIDATES = ["url", "URL", "网址", "链接", "directurl", "direct_url", "Direct URL", "E"]
+PROCESS_DATA_SCRIPT = os.path.join(BASE_DIR, "process_data.py")
 
 # 需要删除的过程文件列表
 TO_DELETE_FILES = [
@@ -34,9 +36,11 @@ TO_DELETE_FILES = [
 ]
 
 
+
 def log(message):
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {message}")
+
 
 
 def hide_python_console():
@@ -49,12 +53,39 @@ def hide_python_console():
             log("警告: 无法隐藏 Python 控制台窗口")
 
 
-def _stream_process_output(process, log_handle):
+
+def decode_output_line(raw_line):
+    if isinstance(raw_line, str):
+        return raw_line
+
+    encodings = ['utf-8', 'gb18030']
+    preferred = locale.getpreferredencoding(False)
+    if preferred:
+        encodings.append(preferred)
+
+    tried = set()
+    for encoding in encodings:
+        if not encoding or encoding.lower() in tried:
+            continue
+        tried.add(encoding.lower())
+        try:
+            return raw_line.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+
+    return raw_line.decode('utf-8', errors='replace')
+
+
+
+def _stream_process_output(process, log_handle, echo_output=True):
     try:
-        for line in iter(process.stdout.readline, ''):
-            if not line:
+        while True:
+            raw_line = process.stdout.readline()
+            if not raw_line:
                 break
-            print(line, end='')
+            line = decode_output_line(raw_line)
+            if echo_output:
+                print(line, end='')
             log_handle.write(line)
             log_handle.flush()
     finally:
@@ -62,7 +93,8 @@ def _stream_process_output(process, log_handle):
             process.stdout.close()
 
 
-def run_native_command(command, process_name, cwd=None, stdin_text=None, log_dir=None):
+
+def run_native_command(command, process_name, cwd=None, stdin_text=None, log_dir=None, echo_output=True):
     command_text = subprocess.list2cmdline(command) if isinstance(command, list) else command
     log(f"执行命令: {command_text}")
 
@@ -73,7 +105,7 @@ def run_native_command(command, process_name, cwd=None, stdin_text=None, log_dir
     if os.name == 'nt' and HIDE_PYTHON_CONSOLE:
         creationflags = subprocess.CREATE_NO_WINDOW
 
-    log_handle = open(log_file, 'w', encoding='utf-8', errors='ignore')
+    log_handle = open(log_file, 'w', encoding='utf-8', errors='replace')
     stdin_pipe = subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL
     process = subprocess.Popen(
         command,
@@ -83,14 +115,12 @@ def run_native_command(command, process_name, cwd=None, stdin_text=None, log_dir
         stdin=stdin_pipe,
         shell=isinstance(command, str),
         creationflags=creationflags,
-        text=True,
-        encoding='utf-8',
-        errors='ignore',
-        bufsize=1
+        text=False,
+        bufsize=0
     )
     output_thread = threading.Thread(
         target=_stream_process_output,
-        args=(process, log_handle),
+        args=(process, log_handle, echo_output),
         daemon=True
     )
     output_thread.start()
@@ -103,12 +133,13 @@ def run_native_command(command, process_name, cwd=None, stdin_text=None, log_dir
 
     if stdin_text is not None and process.stdin is not None:
         try:
-            process.stdin.write(stdin_text)
+            process.stdin.write(stdin_text.encode('utf-8'))
             process.stdin.flush()
         finally:
             process.stdin.close()
 
     return process
+
 
 
 def monitor_process(process_name, process=None, timeout=3600, progress_file=None, stat_file=None):
@@ -117,7 +148,6 @@ def monitor_process(process_name, process=None, timeout=3600, progress_file=None
 
     if process is not None:
         last_report_time = 0
-        last_progress_size = -1
 
         while time.time() - start_time < timeout:
             return_code = process.poll()
@@ -136,7 +166,6 @@ def monitor_process(process_name, process=None, timeout=3600, progress_file=None
             current_size = None
             if progress_file and os.path.exists(progress_file):
                 current_size = os.path.getsize(progress_file)
-                last_progress_size = current_size
 
             stat_summary = ""
             if stat_file and os.path.exists(stat_file):
@@ -209,6 +238,7 @@ def monitor_process(process_name, process=None, timeout=3600, progress_file=None
     return False
 
 
+
 def wait_for_file(file_path, timeout=300, require_non_empty=False):
     log(f"等待文件生成: {file_path}")
     start_time = time.time()
@@ -224,6 +254,7 @@ def wait_for_file(file_path, timeout=300, require_non_empty=False):
     return False
 
 
+
 def generate_unique_filename(base_dir, base_name, ext):
     counter = 1
     original_name = f"{base_name}{ext}"
@@ -235,6 +266,7 @@ def generate_unique_filename(base_dir, base_name, ext):
         counter += 1
 
     return full_path
+
 
 
 def clean_process_files():
@@ -251,6 +283,7 @@ def clean_process_files():
     log("过程文件清理完成")
 
 
+
 def _remove_path(path):
     if os.path.isdir(path):
         shutil.rmtree(path)
@@ -258,8 +291,8 @@ def _remove_path(path):
         os.remove(path)
 
 
-def cleanup_web_survivalscan_outputs():
-    log("清理 Web-SurvivalScan 工作目录中的旧产物...")
+
+def cleanup_web_survivalscan_outputs(extra_paths=None, remove_logs=False):
     stale_paths = [
         os.path.join(WEB_SURVIVALSCAN_DIR, WEB_SURVIVALSCAN_INPUT_NAME),
         os.path.join(WEB_SURVIVALSCAN_DIR, "output.txt"),
@@ -267,10 +300,21 @@ def cleanup_web_survivalscan_outputs():
         os.path.join(WEB_SURVIVALSCAN_DIR, "report.html"),
         os.path.join(WEB_SURVIVALSCAN_DIR, ".data", "report.json"),
     ]
+    if extra_paths:
+        stale_paths.extend(extra_paths)
+
     for stale_path in stale_paths:
         if os.path.exists(stale_path):
             _remove_path(stale_path)
             log(f"已删除旧文件: {stale_path}")
+
+    if remove_logs:
+        for name in os.listdir(WEB_SURVIVALSCAN_DIR):
+            if name.startswith("Web-SurvivalScan_") and name.endswith(".log"):
+                log_path = os.path.join(WEB_SURVIVALSCAN_DIR, name)
+                _remove_path(log_path)
+                log(f"已删除旧日志: {log_path}")
+
 
 
 def count_non_empty_lines(file_path):
@@ -280,11 +324,11 @@ def count_non_empty_lines(file_path):
         return len([line for line in handle.readlines() if line.strip()])
 
 
+
 def process_spray_output(json_file, excel_file):
     log(f"开始处理spray结果: {json_file}")
-    process_data_script = os.path.join(BASE_DIR, "process_data.py")
     result = subprocess.run(
-        ["python", process_data_script, json_file, excel_file],
+        [sys.executable, PROCESS_DATA_SCRIPT, json_file, excel_file],
         capture_output=True,
         text=True,
         cwd=BASE_DIR
@@ -312,8 +356,32 @@ def process_spray_output(json_file, excel_file):
     return {"excel_file": excel_file, "txt_file": txt_file, "url_count": url_count}
 
 
+
+def build_survivalscan_excel(report_json, output_file):
+    log(f"开始生成兼容结果表格: {output_file}")
+    result = subprocess.run(
+        [sys.executable, PROCESS_DATA_SCRIPT, report_json, output_file],
+        capture_output=True,
+        text=True,
+        cwd=BASE_DIR
+    )
+    if result.stdout.strip():
+        log(f"process_data.py 输出:\n{result.stdout.strip()}")
+    if result.stderr.strip():
+        log(f"process_data.py 错误输出:\n{result.stderr.strip()}")
+    if result.returncode != 0:
+        log(f"错误: 兼容结果表格生成失败，返回码: {result.returncode}")
+        return False
+    if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
+        log(f"错误: 未生成兼容结果表格: {output_file}")
+        return False
+    return True
+
+
+
 def _normalize_column_name(value):
     return str(value).strip().lower()
+
 
 
 def _find_column(df, candidates, fallback_index=None):
@@ -331,6 +399,7 @@ def _find_column(df, candidates, fallback_index=None):
         log(f"警告: 未命中候选列名，回退使用第 {fallback_index + 1} 列: {fallback_column}")
         return fallback_column
     return None
+
 
 
 def filter_status_200(excel_file, output_dir, count):
@@ -394,16 +463,21 @@ def filter_status_200(excel_file, output_dir, count):
         return {"success": False, "reason": "exception"}
 
 
+
 def run_web_survivalscan(input_file, output_dir):
     if not os.path.exists(WEB_SURVIVALSCAN_SCRIPT):
         log(f"错误: 未找到 Web-SurvivalScan 脚本: {WEB_SURVIVALSCAN_SCRIPT}")
         return None
 
-    cleanup_web_survivalscan_outputs()
+    log("清理 Web-SurvivalScan 工作目录中的旧产物...")
+    cleanup_web_survivalscan_outputs(remove_logs=True)
 
     staged_input = os.path.join(WEB_SURVIVALSCAN_DIR, WEB_SURVIVALSCAN_INPUT_NAME)
     shutil.copyfile(input_file, staged_input)
     log(f"已复制 Web-SurvivalScan 输入文件: {staged_input}")
+
+    input_count = count_non_empty_lines(staged_input)
+    log(f"Web-SurvivalScan 待验证目标数: {input_count}")
 
     stdin_text = f"{WEB_SURVIVALSCAN_INPUT_NAME}\n{WEB_SURVIVALSCAN_PATH}\n{WEB_SURVIVALSCAN_PROXY}\n"
     process = run_native_command(
@@ -412,6 +486,7 @@ def run_web_survivalscan(input_file, output_dir):
         cwd=WEB_SURVIVALSCAN_DIR,
         stdin_text=stdin_text,
         log_dir=WEB_SURVIVALSCAN_DIR,
+        echo_output=False,
     )
     process_ok = monitor_process("Web-SurvivalScan", process=process, timeout=WEB_SURVIVALSCAN_TIMEOUT)
     if not process_ok:
@@ -422,48 +497,28 @@ def run_web_survivalscan(input_file, output_dir):
     report_json = os.path.join(WEB_SURVIVALSCAN_DIR, ".data", "report.json")
     report_html = os.path.join(WEB_SURVIVALSCAN_DIR, "report.html")
 
-    if not wait_for_file(report_json, timeout=120):
+    if not wait_for_file(report_json, timeout=120, require_non_empty=True):
         log("错误: Web-SurvivalScan 未生成 report.json")
         return None
-    if not wait_for_file(report_html, timeout=120):
-        log("错误: Web-SurvivalScan 未生成 report.html")
-        return None
-    if not os.path.exists(output_file) or not os.path.exists(outerror_file):
-        log("错误: Web-SurvivalScan 未生成 output.txt 或 outerror.txt")
-        return None
 
-    date_str = datetime.datetime.now().strftime('%Y%m%d')
-    input_dest = generate_unique_filename(output_dir, f"web_survivalscan_input_{date_str}", ".txt")
-    alive_dest = generate_unique_filename(output_dir, f"web_survivalscan_alive_{date_str}", ".txt")
-    non200_dest = generate_unique_filename(output_dir, f"web_survivalscan_non200_{date_str}", ".txt")
-    report_json_dest = generate_unique_filename(output_dir, f"web_survivalscan_report_{date_str}", ".json")
-    report_html_dest = generate_unique_filename(output_dir, f"web_survivalscan_report_{date_str}", ".html")
-    log_dest = generate_unique_filename(output_dir, f"web_survivalscan_{date_str}", ".log")
-
-    shutil.copyfile(staged_input, input_dest)
-    shutil.move(output_file, alive_dest)
-    shutil.move(outerror_file, non200_dest)
-    shutil.move(report_json, report_json_dest)
-    shutil.move(report_html, report_html_dest)
-    shutil.move(process.log_file, log_dest)
-    if os.path.exists(staged_input):
-        os.remove(staged_input)
-
-    alive_count = count_non_empty_lines(alive_dest)
-    non200_count = count_non_empty_lines(non200_dest)
+    alive_count = count_non_empty_lines(output_file)
+    non200_count = count_non_empty_lines(outerror_file)
     log(f"Web-SurvivalScan 存活目标数: {alive_count}")
     log(f"Web-SurvivalScan 非200目标数: {non200_count}")
 
+    date_str = datetime.datetime.now().strftime('%Y%m%d')
+    final_excel = generate_unique_filename(output_dir, f"ehole_result_{date_str}", ".xlsx")
+    if not build_survivalscan_excel(report_json, final_excel):
+        return None
+
+    cleanup_web_survivalscan_outputs(extra_paths=[process.log_file, input_file])
+
     return {
-        "input_file": input_dest,
-        "alive_file": alive_dest,
-        "non200_file": non200_dest,
-        "report_json": report_json_dest,
-        "report_html": report_html_dest,
-        "log_file": log_dest,
+        "excel_file": final_excel,
         "alive_count": alive_count,
         "non200_count": non200_count,
     }
+
 
 
 def main():
@@ -538,6 +593,7 @@ def main():
             log("错误: Web-SurvivalScan 执行失败")
             sys.exit(1)
 
+        log(f"兼容结果文件已生成: {survivalscan_result['excel_file']}")
         log(f"自动化流程全部完成！所有结果保存在: {full_date_dir}")
 
     except Exception as e:
@@ -546,7 +602,7 @@ def main():
 
 
 if __name__ == "__main__":
-    os.system("chcp 65001 >nul 2>&1")  # 确保中文显示正常
+    os.system("chcp 65001 >nul 2>&1")
 
     try:
         import psutil
