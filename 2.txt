@@ -1,0 +1,463 @@
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import Border, Side, Alignment, Font, PatternFill
+from openpyxl.formatting.rule import ColorScaleRule, FormulaRule
+from openpyxl.utils import get_column_letter
+
+
+def extract_urls_from_stdout(stdout_text):
+    """从标准输出中提取http/https URL"""
+    if not stdout_text:
+        return []
+
+    urls = re.findall(r'https?://\S+', stdout_text)
+    cleaned_urls = []
+    for url in urls:
+        cleaned_url = re.sub(r'[,\]\)\]>]+$', '', url)
+        cleaned_urls.append(cleaned_url)
+
+    return list(dict.fromkeys(cleaned_urls))
+
+
+
+def snapshot_url_file_state(file_path="url.txt"):
+    """记录url.txt在扫描前后的存在性、修改时间和大小"""
+    if not os.path.exists(file_path):
+        return {
+            'exists': False,
+            'mtime_ns': None,
+            'size': 0,
+        }
+
+    stat = os.stat(file_path)
+    return {
+        'exists': True,
+        'mtime_ns': stat.st_mtime_ns,
+        'size': stat.st_size,
+    }
+
+
+
+def is_non_empty_url_file(file_state):
+    """判断url.txt是否存在且非空"""
+    return file_state['exists'] and file_state['size'] > 0
+
+
+
+def url_file_was_updated_this_run(before_state, after_state):
+    """判断url.txt是否由本次扫描创建或更新"""
+    if not after_state['exists']:
+        return False
+
+    if not before_state['exists']:
+        return True
+
+    return (
+        after_state['mtime_ns'] != before_state['mtime_ns']
+        or after_state['size'] != before_state['size']
+    )
+
+
+
+def write_url_file_from_stdout_if_needed(extracted_urls, before_state, after_state):
+    """仅在本次扫描未生成新的非空url.txt时，从本次标准输出生成url.txt"""
+    url_file_path = "url.txt"
+    file_updated_this_run = url_file_was_updated_this_run(before_state, after_state)
+    fresh_non_empty_url_file = file_updated_this_run and is_non_empty_url_file(after_state)
+
+    if fresh_non_empty_url_file:
+        print("检测到本次扫描已生成新的非空url.txt，跳过stdout兜底生成")
+        return False
+
+    if not extracted_urls:
+        if file_updated_this_run and after_state['exists'] and after_state['size'] == 0:
+            print("本次扫描更新了url.txt，但结果为空，且stdout中未提取到任何URL")
+        elif after_state['exists'] and not file_updated_this_run:
+            print("检测到url.txt存在但未被本次扫描更新，且stdout中未提取到任何URL")
+        else:
+            print("本次扫描未生成新的非空url.txt，且stdout中未提取到任何URL")
+        return False
+
+    try:
+        with open(url_file_path, "w", encoding="utf-8") as f:
+            for url in extracted_urls:
+                f.write(url + "\n")
+
+        if after_state['exists'] and not file_updated_this_run:
+            print(f"url.txt未被本次扫描更新，已根据本次stdout生成新的url.txt，共写入 {len(extracted_urls)} 条URL")
+        else:
+            print(f"本次扫描未生成新的非空url.txt，已根据本次stdout生成url.txt，共写入 {len(extracted_urls)} 条URL")
+        return True
+    except Exception as e:
+        print(f"从stdout生成url.txt失败: {e}")
+        return False
+
+
+
+def run_ts_scan():
+    """执行ts命令进行扫描，实时回显并收集输出"""
+    print("开始执行端口扫描...")
+    cmd = 'ts -hf ip.txt -portf ports.txt -np -m port,url -t 100'
+    url_file_before = snapshot_url_file_state()
+    output_chunks = []
+
+    try:
+        process = subprocess.Popen(
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding='utf-8',
+            errors='ignore',
+            bufsize=1,
+        )
+
+        if process.stdout is not None:
+            while True:
+                line = process.stdout.readline()
+                if not line:
+                    if process.poll() is not None:
+                        break
+                    continue
+                print(line, end="")
+                output_chunks.append(line)
+
+        return_code = process.wait()
+        url_file_after = snapshot_url_file_state()
+        stdout_text = "".join(output_chunks)
+
+        if return_code != 0:
+            print(f"扫描进程返回非零退出码: {return_code}")
+
+        return {
+            'success': return_code == 0,
+            'return_code': return_code,
+            'stdout_text': stdout_text,
+            'url_file_before': url_file_before,
+            'url_file_after': url_file_after,
+        }
+    except Exception as e:
+        print(f"执行命令时发生错误: {e}")
+        return {
+            'success': False,
+            'return_code': None,
+            'stdout_text': "".join(output_chunks),
+            'url_file_before': url_file_before,
+            'url_file_after': snapshot_url_file_state(),
+        }
+
+def parse_url_file():
+    """解析url.txt文件，提取详细信息，处理URL末尾的逗号"""
+    if not os.path.exists("url.txt"):
+        print("url.txt文件不存在，请先执行扫描")
+        return []
+    
+    with open("url.txt", "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    
+    parsed_data = []
+    current_id = 1
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+            
+        # 检查是否为单行URL
+        url_match = re.match(r'^(http[s]?://\S+)$', line)
+        if url_match:
+            url = url_match.group(1)
+            # 清除URL末尾的逗号
+            url = re.sub(r',$', '', url)  # 新增：移除末尾逗号
+            parsed_data.append({
+                '序号': current_id,
+                'IP地址': '',
+                '端口': '',
+                '协议': '',
+                '状态码': '',
+                'URL': url,
+                '技术栈': '',
+                '页面标题': ''
+            })
+            current_id += 1
+            continue
+            
+        # 尝试修复可能的格式问题（如URL和协议连在一起）
+        line = re.sub(r'(http[s]?://\S+)(TCP/HTTP)', r'\1, \2', line)
+            
+        # 解析完整格式行：协议, [状态码], [技术栈], URL, [页面标题]
+        full_match = re.match(
+            r'^(\w+/\w+),\s*\[\s*(\d+)\s*\],\s*\[(.*?)\],\s*(http[s]?://\S+),\s*\[(.*?)\],?$', 
+            line
+        )
+        
+        if full_match:
+            protocol = full_match.group(1)
+            status_code = full_match.group(2)
+            technologies = full_match.group(3)
+            url = full_match.group(4)
+            page_title = full_match.group(5)
+            
+            # 清除URL末尾的逗号（核心修复）
+            url = re.sub(r',$', '', url)  # 新增：移除末尾逗号
+            
+            # 提取IP和端口
+            ip_port_pattern = re.compile(r'http[s]?://([^:/]+):?(\d+)?')
+            ip_port_match = ip_port_pattern.search(url)
+            ip = ip_port_match.group(1) if ip_port_match else ""
+            port = ip_port_match.group(2) if ip_port_match and ip_port_match.group(2) else ""
+            
+            parsed_data.append({
+                '序号': current_id,
+                'IP地址': ip,
+                '端口': port,
+                '协议': protocol,
+                '状态码': status_code,
+                'URL': url,
+                '技术栈': technologies,
+                '页面标题': page_title
+            })
+            current_id += 1
+            continue
+            
+        # 尝试解析其他可能的格式（如缺少页面标题）
+        partial_match = re.match(
+            r'^(\w+/\w+),\s*\[\s*(\d+)\s*\],\s*\[(.*?)\],\s*(http[s]?://\S+),?\s*$', 
+            line
+        )
+        
+        if partial_match:
+            protocol = partial_match.group(1)
+            status_code = partial_match.group(2)
+            technologies = partial_match.group(3)
+            url = partial_match.group(4)
+            page_title = ""
+            
+            # 清除URL末尾的逗号（核心修复）
+            url = re.sub(r',$', '', url)  # 新增：移除末尾逗号
+            
+            # 提取IP和端口
+            ip_port_pattern = re.compile(r'http[s]?://([^:/]+):?(\d+)?')
+            ip_port_match = ip_port_pattern.search(url)
+            ip = ip_port_match.group(1) if ip_port_match else ""
+            port = ip_port_match.group(2) if ip_port_match and ip_port_match.group(2) else ""
+            
+            parsed_data.append({
+                '序号': current_id,
+                'IP地址': ip,
+                '端口': port,
+                '协议': protocol,
+                '状态码': status_code,
+                'URL': url,
+                '技术栈': technologies,
+                '页面标题': page_title
+            })
+            current_id += 1
+            continue
+            
+        # 如果无法解析，尝试提取URL
+        url_in_line = re.search(r'(http[s]?://\S+)', line)
+        if url_in_line:
+            url = url_in_line.group(1)
+            
+            # 清除URL末尾的逗号（核心修复）
+            url = re.sub(r',$', '', url)  # 新增：移除末尾逗号
+            
+            # 提取IP和端口
+            ip_port_pattern = re.compile(r'http[s]?://([^:/]+):?(\d+)?')
+            ip_port_match = ip_port_pattern.search(url)
+            ip = ip_port_match.group(1) if ip_port_match else ""
+            port = ip_port_match.group(2) if ip_port_match and ip_port_match.group(2) else ""
+            
+            parsed_data.append({
+                '序号': current_id,
+                'IP地址': ip,
+                '端口': port,
+                '协议': '',
+                '状态码': '',
+                'URL': url,
+                '技术栈': '',
+                '页面标题': ''
+            })
+            current_id += 1
+            print(f"警告：部分解析行 - {line}")
+            continue
+            
+        # 如果完全无法解析，记录原始行
+        print(f"警告：无法解析行 - {line}")
+    
+    return parsed_data
+
+def generate_excel(data, file_path=None):
+    """生成Excel表格并美化"""
+    if not data:
+        print("没有数据可生成表格")
+        return
+    
+    if file_path is None:
+        file_path = f"url_details_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    
+    # 创建DataFrame
+    df = pd.DataFrame(data)
+    
+    # 保存为Excel文件
+    df.to_excel(file_path, index=False, engine='openpyxl')
+    
+    # 美化Excel表格
+    beautify_excel(file_path)
+    
+    print(f"详细表格已保存到 {file_path}")
+    
+    # 返回数据用于预览
+    return df
+
+def beautify_excel(file_path):
+    """美化Excel表格"""
+    try:
+        wb = load_workbook(file_path)
+        ws = wb.active
+        
+        # 表头样式 - 绿色系
+        header_font = Font(bold=True, color="FFFFFF", size=12)
+        header_fill = PatternFill(start_color="34A853", end_color="34A853", fill_type="solid")
+        
+        # 数据样式
+        data_font = Font(color="000000", size=11)
+        thin_border = Border(
+            left=Side(style='thin'), 
+            right=Side(style='thin'), 
+            top=Side(style='thin'), 
+            bottom=Side(style='thin')
+        )
+        
+        # 应用表头样式
+        for cell in ws[1]:
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+        
+        # 应用数据样式
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                cell.font = data_font
+                cell.border = thin_border
+                cell.alignment = Alignment(horizontal='left', vertical='center')
+        
+        # 自动调整列宽
+        for col in ws.columns:
+            max_length = 0
+            column = col[0].column_letter
+            for cell in col:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = (max_length + 2)
+            ws.column_dimensions[column].width = min(adjusted_width, 50)  # 限制最大宽度
+        
+        # 为URL添加超链接样式
+        if 'URL' in [cell.value for cell in ws[1]]:
+            col_idx = [cell.value for cell in ws[1]].index('URL') + 1
+            for row in range(2, ws.max_row + 1):
+                cell = ws.cell(row=row, column=col_idx)
+                if cell.value and isinstance(cell.value, str) and cell.value.startswith(('http', 'https')):
+                    cell.hyperlink = cell.value
+                    cell.font = Font(color="0563C1", underline="single")
+        
+        # 添加条件格式 - 状态码高亮
+        if '状态码' in [cell.value for cell in ws[1]]:
+            col_idx = [cell.value for cell in ws[1]].index('状态码') + 1
+            status_range = f"{get_column_letter(col_idx)}2:{get_column_letter(col_idx)}{ws.max_row}"
+            
+            # 状态码条件格式 - 绿色系渐变
+            ws.conditional_formatting.add(status_range,
+                ColorScaleRule(start_type='min', start_color='FFD6CC', 
+                              mid_type='percentile', mid_value=50, mid_color='FFF6CC',
+                              end_type='max', end_color='CCFFCC')
+            )
+        
+        # 设置自动筛选 - 筛选所有列
+        if ws.max_row > 1:  # 确保有数据行
+            ws.auto_filter.ref = f'A1:{get_column_letter(ws.max_column)}{ws.max_row}'
+        
+        wb.save(file_path)
+        print(f"Excel表格美化完成: {file_path}")
+    except Exception as e:
+        print(f"美化Excel失败: {e}")
+
+def save_urls_to_file(data):
+    """将解析的URL去重后保存到url.txt文件中"""
+    if not data:
+        print("没有URL数据可保存")
+        return
+
+    try:
+        urls = []
+        for item in data:
+            url = item.get('URL', '').strip()
+            if url:
+                urls.append(url)
+
+        unique_urls = list(dict.fromkeys(urls))
+
+        with open("url.txt", "w", encoding="utf-8") as f:
+            for url in unique_urls:
+                f.write(url + "\n")
+
+        print(f"已将 {len(unique_urls)} 个去重URL保存到url.txt（原始 {len(urls)} 条）")
+    except Exception as e:
+        print(f"保存URL到文件失败: {e}")
+
+def main():
+    """主函数"""
+    print("=" * 50)
+    print("网络扫描与URL提取工具")
+    print("=" * 50)
+
+    scan_result = run_ts_scan()
+    if not scan_result['success']:
+        print(f"扫描失败，退出码: {scan_result['return_code']}")
+        sys.exit(1)
+
+    stdout_urls = extract_urls_from_stdout(scan_result['stdout_text'])
+    fresh_url_file = (
+        url_file_was_updated_this_run(scan_result['url_file_before'], scan_result['url_file_after'])
+        and is_non_empty_url_file(scan_result['url_file_after'])
+    )
+
+    fallback_written = write_url_file_from_stdout_if_needed(
+        stdout_urls,
+        scan_result['url_file_before'],
+        scan_result['url_file_after'],
+    )
+
+    if fresh_url_file:
+        print("扫描完成，本次扫描已生成新的非空url.txt")
+    elif fallback_written:
+        print("扫描完成，本次扫描未生成新的非空url.txt，已根据stdout补写url.txt")
+    else:
+        print("扫描完成，但本次扫描未生成可用的url.txt")
+        sys.exit(1)
+
+    parsed_data = parse_url_file()
+    if not parsed_data:
+        print("没有解析到任何URL数据！")
+        sys.exit(1)
+
+    df = generate_excel(parsed_data)
+    save_urls_to_file(parsed_data)
+
+    print("\n表格预览:")
+    print(df.head().to_string())
+    print(f"\n共解析出 {len(parsed_data)} 条记录")
+    print("\n操作完成!")
+
+if __name__ == "__main__":
+    main()
