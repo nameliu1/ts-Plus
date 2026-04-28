@@ -15,22 +15,29 @@ URL_FILE = os.path.join(BASE_DIR, "url.txt")
 DIR_FILE = os.path.join(BASE_DIR, "dirv2.txt")
 JSON_FILE = os.path.join(BASE_DIR, "res.json")        # spray原始输出
 STAT_FILE = os.path.join(BASE_DIR, "url.txt.stat")
+WEB_SURVIVALSCAN_DIR = os.path.join(BASE_DIR, "tools", "web_survivalscan")
+WEB_SURVIVALSCAN_SCRIPT = os.path.join(WEB_SURVIVALSCAN_DIR, "Web-SurvivalScan.py")
+WEB_SURVIVALSCAN_TIMEOUT = 3600
+WEB_SURVIVALSCAN_PATH = ""
+WEB_SURVIVALSCAN_PROXY = ""
+WEB_SURVIVALSCAN_INPUT_NAME = "web_survivalscan_targets.txt"
 HIDE_PYTHON_CONSOLE = False
 MONITOR_INTERVAL = 5  # 进程监控间隔（秒）
 STATUS_CODE_COL_INDEX = 9  # 兼容旧格式的J列索引
 URL_COL_INDEX = 4  # 兼容旧格式的E列索引
 STATUS_CODE_CANDIDATES = ["status", "状态码", "status_code", "code", "Status", "STATUS", "J"]
 URL_CANDIDATES = ["url", "URL", "网址", "链接", "directurl", "direct_url", "Direct URL", "E"]
-EHOLE_QUICK_TIMEOUT = 3  # ehole快速完成的超时时间（秒）
 
 # 需要删除的过程文件列表
 TO_DELETE_FILES = [
     os.path.join(BASE_DIR, "res_processed.txt")
 ]
 
+
 def log(message):
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {message}")
+
 
 def hide_python_console():
     if HIDE_PYTHON_CONSOLE:
@@ -38,8 +45,9 @@ def hide_python_console():
             import win32gui, win32con
             hwnd = win32gui.GetForegroundWindow()
             win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
-        except:
+        except Exception:
             log("警告: 无法隐藏 Python 控制台窗口")
+
 
 def _stream_process_output(process, log_handle):
     try:
@@ -54,25 +62,25 @@ def _stream_process_output(process, log_handle):
             process.stdout.close()
 
 
-def run_native_command(command, process_name):
+def run_native_command(command, process_name, cwd=None, stdin_text=None, log_dir=None):
     command_text = subprocess.list2cmdline(command) if isinstance(command, list) else command
     log(f"执行命令: {command_text}")
 
-    # 生成日志文件路径
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = os.path.join(BASE_DIR, f"{process_name}_{timestamp}.log")
+    log_file = os.path.join(log_dir or BASE_DIR, f"{process_name}_{timestamp}.log")
 
     creationflags = 0
     if os.name == 'nt' and HIDE_PYTHON_CONSOLE:
         creationflags = subprocess.CREATE_NO_WINDOW
 
     log_handle = open(log_file, 'w', encoding='utf-8', errors='ignore')
+    stdin_pipe = subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL
     process = subprocess.Popen(
         command,
-        cwd=BASE_DIR,
+        cwd=cwd or BASE_DIR,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL,
+        stdin=stdin_pipe,
         shell=isinstance(command, str),
         creationflags=creationflags,
         text=True,
@@ -92,7 +100,16 @@ def run_native_command(command, process_name):
     process.output_thread = output_thread
     log(f"命令输出将保存到: {log_file}")
     log(f"已启动进程: {process_name} (PID: {process.pid})")
+
+    if stdin_text is not None and process.stdin is not None:
+        try:
+            process.stdin.write(stdin_text)
+            process.stdin.flush()
+        finally:
+            process.stdin.close()
+
     return process
+
 
 def monitor_process(process_name, process=None, timeout=3600, progress_file=None, stat_file=None):
     log(f"监控进程: {process_name}")
@@ -101,12 +118,11 @@ def monitor_process(process_name, process=None, timeout=3600, progress_file=None
     if process is not None:
         last_report_time = 0
         last_progress_size = -1
-        stagnant = False
 
         while time.time() - start_time < timeout:
             return_code = process.poll()
             if return_code is not None:
-                print()  # 进度条换行
+                print()
                 if hasattr(process, 'output_thread') and process.output_thread:
                     process.output_thread.join(timeout=2)
                 if hasattr(process, 'log_handle') and process.log_handle and not process.log_handle.closed:
@@ -120,10 +136,7 @@ def monitor_process(process_name, process=None, timeout=3600, progress_file=None
             current_size = None
             if progress_file and os.path.exists(progress_file):
                 current_size = os.path.getsize(progress_file)
-                stagnant = current_size == last_progress_size
                 last_progress_size = current_size
-            else:
-                stagnant = False
 
             stat_summary = ""
             if stat_file and os.path.exists(stat_file):
@@ -177,29 +190,16 @@ def monitor_process(process_name, process=None, timeout=3600, progress_file=None
             log(f"请查看日志文件: {process.log_file}")
         return False
 
-    # 兼容旧逻辑：按进程名监控
-    # 特殊处理ehole进程的快速完成情况
-    is_ehole = process_name.lower() == "ehole.exe"
-    quick_timeout = EHOLE_QUICK_TIMEOUT
-
-    # 等待进程启动
     while time.time() - start_time < timeout:
         if any(proc.name().lower() == process_name.lower() for proc in psutil.process_iter()):
             log(f"进程已启动: {process_name}")
             break
-
-        # 检查是否是ehole并且已经超过快速超时时间
-        if is_ehole and (time.time() - start_time > quick_timeout):
-            log(f"警告: ehole在{quick_timeout}秒内未启动，可能已快速完成")
-            return True
-
         time.sleep(1)
     else:
         log(f"错误: 等待 {process_name} 启动超时")
         return False
 
     start_time = time.time()
-    # 等待进程结束
     while time.time() - start_time < timeout:
         if not any(proc.name().lower() == process_name.lower() for proc in psutil.process_iter()):
             log(f"进程已结束: {process_name}")
@@ -207,6 +207,7 @@ def monitor_process(process_name, process=None, timeout=3600, progress_file=None
         time.sleep(1)
     log(f"错误: {process_name} 运行超时")
     return False
+
 
 def wait_for_file(file_path, timeout=300, require_non_empty=False):
     log(f"等待文件生成: {file_path}")
@@ -222,21 +223,20 @@ def wait_for_file(file_path, timeout=300, require_non_empty=False):
     log(f"错误: 文件未生成: {file_path}")
     return False
 
-# 生成不冲突的文件名
+
 def generate_unique_filename(base_dir, base_name, ext):
     counter = 1
     original_name = f"{base_name}{ext}"
     full_path = os.path.join(base_dir, original_name)
-    
-    # 如果文件已存在，则添加序号后缀
+
     while os.path.exists(full_path):
         new_name = f"{base_name}_{counter}{ext}"
         full_path = os.path.join(base_dir, new_name)
         counter += 1
-    
+
     return full_path
 
-# 删除指定的过程文件
+
 def clean_process_files():
     log("开始清理上次运行的过程文件...")
     for file_path in TO_DELETE_FILES:
@@ -249,6 +249,36 @@ def clean_process_files():
         else:
             log(f"文件不存在，跳过删除: {file_path}")
     log("过程文件清理完成")
+
+
+def _remove_path(path):
+    if os.path.isdir(path):
+        shutil.rmtree(path)
+    elif os.path.exists(path):
+        os.remove(path)
+
+
+def cleanup_web_survivalscan_outputs():
+    log("清理 Web-SurvivalScan 工作目录中的旧产物...")
+    stale_paths = [
+        os.path.join(WEB_SURVIVALSCAN_DIR, WEB_SURVIVALSCAN_INPUT_NAME),
+        os.path.join(WEB_SURVIVALSCAN_DIR, "output.txt"),
+        os.path.join(WEB_SURVIVALSCAN_DIR, "outerror.txt"),
+        os.path.join(WEB_SURVIVALSCAN_DIR, "report.html"),
+        os.path.join(WEB_SURVIVALSCAN_DIR, ".data", "report.json"),
+    ]
+    for stale_path in stale_paths:
+        if os.path.exists(stale_path):
+            _remove_path(stale_path)
+            log(f"已删除旧文件: {stale_path}")
+
+
+def count_non_empty_lines(file_path):
+    if not os.path.exists(file_path):
+        return 0
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as handle:
+        return len([line for line in handle.readlines() if line.strip()])
+
 
 def process_spray_output(json_file, excel_file):
     log(f"开始处理spray结果: {json_file}")
@@ -280,6 +310,7 @@ def process_spray_output(json_file, excel_file):
         url_count = len([line for line in f.readlines() if line.strip()])
     log(f"成功提取 {url_count} 个URL")
     return {"excel_file": excel_file, "txt_file": txt_file, "url_count": url_count}
+
 
 def _normalize_column_name(value):
     return str(value).strip().lower()
@@ -331,7 +362,7 @@ def filter_status_200(excel_file, output_dir, count):
         log(f"Excel总行数: {total_rows}，状态码为200的行数: {filtered_rows}")
 
         if filtered_rows == 0:
-            log("警告: 未找到状态码为200的URL，本次将跳过ehole阶段")
+            log("警告: 未找到状态码为200的URL，本次将跳过 Web-SurvivalScan 阶段")
             return {"success": True, "has_results": False, "output_file": None, "count": 0}
 
         urls_200 = df_200[url_col].astype(str).str.strip()
@@ -339,7 +370,7 @@ def filter_status_200(excel_file, output_dir, count):
         log(f"提取并去重后得到 {len(urls_200)} 个状态码为200的URL")
 
         if not urls_200:
-            log("警告: 200状态码记录存在，但URL列为空，本次将跳过ehole阶段")
+            log("警告: 200状态码记录存在，但URL列为空，本次将跳过 Web-SurvivalScan 阶段")
             return {"success": True, "has_results": False, "output_file": None, "count": 0}
 
         date_str = datetime.datetime.now().strftime("%Y%m%d")
@@ -362,22 +393,92 @@ def filter_status_200(excel_file, output_dir, count):
         log(f"筛选错误: {e}")
         return {"success": False, "reason": "exception"}
 
+
+def run_web_survivalscan(input_file, output_dir):
+    if not os.path.exists(WEB_SURVIVALSCAN_SCRIPT):
+        log(f"错误: 未找到 Web-SurvivalScan 脚本: {WEB_SURVIVALSCAN_SCRIPT}")
+        return None
+
+    cleanup_web_survivalscan_outputs()
+
+    staged_input = os.path.join(WEB_SURVIVALSCAN_DIR, WEB_SURVIVALSCAN_INPUT_NAME)
+    shutil.copyfile(input_file, staged_input)
+    log(f"已复制 Web-SurvivalScan 输入文件: {staged_input}")
+
+    stdin_text = f"{WEB_SURVIVALSCAN_INPUT_NAME}\n{WEB_SURVIVALSCAN_PATH}\n{WEB_SURVIVALSCAN_PROXY}\n"
+    process = run_native_command(
+        [sys.executable, "Web-SurvivalScan.py"],
+        "Web-SurvivalScan",
+        cwd=WEB_SURVIVALSCAN_DIR,
+        stdin_text=stdin_text,
+        log_dir=WEB_SURVIVALSCAN_DIR,
+    )
+    process_ok = monitor_process("Web-SurvivalScan", process=process, timeout=WEB_SURVIVALSCAN_TIMEOUT)
+    if not process_ok:
+        log("警告: Web-SurvivalScan 返回非零退出码，将继续检查产物")
+
+    output_file = os.path.join(WEB_SURVIVALSCAN_DIR, "output.txt")
+    outerror_file = os.path.join(WEB_SURVIVALSCAN_DIR, "outerror.txt")
+    report_json = os.path.join(WEB_SURVIVALSCAN_DIR, ".data", "report.json")
+    report_html = os.path.join(WEB_SURVIVALSCAN_DIR, "report.html")
+
+    if not wait_for_file(report_json, timeout=120):
+        log("错误: Web-SurvivalScan 未生成 report.json")
+        return None
+    if not wait_for_file(report_html, timeout=120):
+        log("错误: Web-SurvivalScan 未生成 report.html")
+        return None
+    if not os.path.exists(output_file) or not os.path.exists(outerror_file):
+        log("错误: Web-SurvivalScan 未生成 output.txt 或 outerror.txt")
+        return None
+
+    date_str = datetime.datetime.now().strftime('%Y%m%d')
+    input_dest = generate_unique_filename(output_dir, f"web_survivalscan_input_{date_str}", ".txt")
+    alive_dest = generate_unique_filename(output_dir, f"web_survivalscan_alive_{date_str}", ".txt")
+    non200_dest = generate_unique_filename(output_dir, f"web_survivalscan_non200_{date_str}", ".txt")
+    report_json_dest = generate_unique_filename(output_dir, f"web_survivalscan_report_{date_str}", ".json")
+    report_html_dest = generate_unique_filename(output_dir, f"web_survivalscan_report_{date_str}", ".html")
+    log_dest = generate_unique_filename(output_dir, f"web_survivalscan_{date_str}", ".log")
+
+    shutil.copyfile(staged_input, input_dest)
+    shutil.move(output_file, alive_dest)
+    shutil.move(outerror_file, non200_dest)
+    shutil.move(report_json, report_json_dest)
+    shutil.move(report_html, report_html_dest)
+    shutil.move(process.log_file, log_dest)
+    if os.path.exists(staged_input):
+        os.remove(staged_input)
+
+    alive_count = count_non_empty_lines(alive_dest)
+    non200_count = count_non_empty_lines(non200_dest)
+    log(f"Web-SurvivalScan 存活目标数: {alive_count}")
+    log(f"Web-SurvivalScan 非200目标数: {non200_count}")
+
+    return {
+        "input_file": input_dest,
+        "alive_file": alive_dest,
+        "non200_file": non200_dest,
+        "report_json": report_json_dest,
+        "report_html": report_html_dest,
+        "log_file": log_dest,
+        "alive_count": alive_count,
+        "non200_count": non200_count,
+    }
+
+
 def main():
     try:
         hide_python_console()
-        log(f"开始自动化漏洞扫描和指纹识别流程")
+        log("开始自动化漏洞扫描和Web存活验证流程")
         log(f"基础目录: {BASE_DIR}")
-        
-        # 创建日期文件夹
+
         date_folder = datetime.datetime.now().strftime("%m%d")
         full_date_dir = os.path.join(BASE_DIR, date_folder)
         os.makedirs(full_date_dir, exist_ok=True)
         log(f"创建日期文件夹: {full_date_dir}")
-        
-        # 清理指定的过程文件
+
         clean_process_files()
-        
-        # 步骤1: 执行spray扫描
+
         log("步骤1: 执行spray扫描...")
         spray_cmd = f'spray.exe -l "{URL_FILE}" -d "{DIR_FILE}" -f "{JSON_FILE}"'
         spray_process = run_native_command(spray_cmd, "spray.exe")
@@ -387,17 +488,14 @@ def main():
         if not wait_for_file(JSON_FILE):
             log("错误: spray未生成结果文件")
             sys.exit(1)
-        
-        # 步骤2: 处理spray结果，提取有效URL
-        log("步骤2: 处理spray结果，提取有效URL...")
 
+        log("步骤2: 处理spray结果，提取有效URL...")
         unique_excel_file = generate_unique_filename(BASE_DIR, "res_processed", ".xlsx")
         spray_output = process_spray_output(JSON_FILE, unique_excel_file)
         if not spray_output:
             log("错误: 处理spray输出失败")
             sys.exit(1)
 
-        # 步骤3: 筛选状态码200的URL
         log("步骤3: 筛选状态码200的URL...")
         filter_result = filter_status_200(spray_output["excel_file"], full_date_dir, 1)
         if not filter_result.get("success"):
@@ -405,20 +503,17 @@ def main():
             sys.exit(1)
 
         filtered_txt_path = filter_result.get("output_file")
-        
-        # 步骤3.5: 移动Spray结果文件到日期文件夹
+
         log("步骤3.5: 移动Spray结果文件到日期文件夹...")
-        
-        # 为移动的文件生成唯一文件名
         spray_json_base = f"spray_original_{datetime.datetime.now().strftime('%Y%m%d')}"
         spray_json_dest = generate_unique_filename(full_date_dir, spray_json_base, ".json")
-        
+
         spray_excel_base = f"spray_processed_{datetime.datetime.now().strftime('%Y%m%d')}"
         spray_excel_dest = generate_unique_filename(full_date_dir, spray_excel_base, ".xlsx")
-        
+
         shutil.move(JSON_FILE, spray_json_dest)
         log(f"已移动Spray原始结果: {spray_json_dest}")
-        
+
         shutil.move(spray_output["excel_file"], spray_excel_dest)
         log(f"已移动Spray处理后Excel: {spray_excel_dest}")
 
@@ -430,45 +525,18 @@ def main():
             log(f"已移动Spray提取URL列表: {spray_txt_dest}")
 
         if not filter_result.get("has_results"):
-            log(f"自动化流程完成：Spray阶段已完成，但未发现状态码200的URL，已跳过ehole。结果保存在: {full_date_dir}")
+            log(f"自动化流程完成：Spray阶段已完成，但未发现状态码200的URL，已跳过 Web-SurvivalScan。结果保存在: {full_date_dir}")
             return
 
         if not filtered_txt_path or not os.path.exists(filtered_txt_path) or os.path.getsize(filtered_txt_path) == 0:
-            log("错误: ehole输入文件不存在或为空")
+            log("错误: Web-SurvivalScan 输入文件不存在或为空")
             sys.exit(1)
 
-        # 步骤4: 执行ehole指纹识别
-        log("步骤4: 执行ehole指纹识别...")
-
-        ehole_base = f"ehole_result_{datetime.datetime.now().strftime('%Y%m%d')}"
-        ehole_output = generate_unique_filename(full_date_dir, ehole_base, ".xlsx")
-
-        ehole_cmd = f'ehole finger -l "{filtered_txt_path}" -o "{ehole_output}" -t 10'
-        ehole_process = run_native_command(ehole_cmd, "ehole.exe")
-
-        if not monitor_process("ehole.exe", process=ehole_process, timeout=1800):
-            log("错误: ehole执行失败或超时")
-
-        if not wait_for_file(ehole_output, require_non_empty=True):
-            log("错误: ehole未生成结果文件")
+        log("步骤4: 执行 Web-SurvivalScan 存活验证...")
+        survivalscan_result = run_web_survivalscan(filtered_txt_path, full_date_dir)
+        if not survivalscan_result:
+            log("错误: Web-SurvivalScan 执行失败")
             sys.exit(1)
-
-        log("美化ehole结果表格...")
-        process_data_script = os.path.join(BASE_DIR, "process_data.py")
-        beautify_result = subprocess.run(
-            ["python", process_data_script, ehole_output, ehole_output],
-            capture_output=True,
-            text=True,
-            cwd=BASE_DIR
-        )
-        if beautify_result.stdout.strip():
-            log(f"ehole美化输出:\n{beautify_result.stdout.strip()}")
-        if beautify_result.stderr.strip():
-            log(f"ehole美化错误输出:\n{beautify_result.stderr.strip()}")
-        if beautify_result.returncode != 0:
-            log(f"警告: ehole结果表格美化失败，返回码: {beautify_result.returncode}")
-        else:
-            log("ehole结果表格美化完成")
 
         log(f"自动化流程全部完成！所有结果保存在: {full_date_dir}")
 
@@ -476,15 +544,15 @@ def main():
         log(f"程序异常: {str(e)}")
         sys.exit(1)
 
+
 if __name__ == "__main__":
     os.system("chcp 65001 >nul 2>&1")  # 确保中文显示正常
-    
-    # 检查依赖
+
     try:
         import psutil
         import pandas as pd
     except ImportError:
         log("错误: 缺少psutil或pandas库，请执行 'pip install psutil pandas'")
         sys.exit(1)
-    
+
     main()
