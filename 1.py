@@ -327,6 +327,16 @@ def count_non_empty_lines(file_path):
 
 def process_spray_output(json_file, excel_file):
     log(f"开始处理spray结果: {json_file}")
+
+    if not os.path.exists(json_file):
+        log(f"错误: Spray结果文件不存在: {json_file}")
+        return None
+
+    json_size = os.path.getsize(json_file)
+    if json_size == 0:
+        log(f"警告: Spray结果文件为空，跳过后续URL提取: {json_file}")
+        return {"excel_file": None, "txt_file": None, "url_count": 0, "is_empty": True}
+
     result = subprocess.run(
         [sys.executable, PROCESS_DATA_SCRIPT, json_file, excel_file],
         capture_output=True,
@@ -353,7 +363,7 @@ def process_spray_output(json_file, excel_file):
     with open(txt_file, 'r', encoding='utf-8', errors='ignore') as f:
         url_count = len([line for line in f.readlines() if line.strip()])
     log(f"成功提取 {url_count} 个URL")
-    return {"excel_file": excel_file, "txt_file": txt_file, "url_count": url_count}
+    return {"excel_file": excel_file, "txt_file": txt_file, "url_count": url_count, "is_empty": False}
 
 
 
@@ -551,36 +561,42 @@ def main():
             log("错误: 处理spray输出失败")
             sys.exit(1)
 
-        log("步骤3: 筛选状态码200的URL...")
-        filter_result = filter_status_200(spray_output["excel_file"], full_date_dir, 1)
-        if not filter_result.get("success"):
-            log("错误: 状态码200筛选失败")
-            sys.exit(1)
+        filter_result = {"success": True, "has_results": False, "output_file": None, "count": 0}
+        if not spray_output.get("is_empty"):
+            log("步骤3: 筛选状态码200的URL...")
+            filter_result = filter_status_200(spray_output["excel_file"], full_date_dir, 1)
+            if not filter_result.get("success"):
+                log("错误: 状态码200筛选失败")
+                sys.exit(1)
+        else:
+            log("步骤3: Spray结果为空，跳过状态码200筛选")
 
         filtered_txt_path = filter_result.get("output_file")
 
         log("步骤3.5: 移动Spray结果文件到日期文件夹...")
         spray_json_base = f"spray_original_{datetime.datetime.now().strftime('%Y%m%d')}"
         spray_json_dest = generate_unique_filename(full_date_dir, spray_json_base, ".json")
-
-        spray_excel_base = f"spray_processed_{datetime.datetime.now().strftime('%Y%m%d')}"
-        spray_excel_dest = generate_unique_filename(full_date_dir, spray_excel_base, ".xlsx")
-
         shutil.move(JSON_FILE, spray_json_dest)
         log(f"已移动Spray原始结果: {spray_json_dest}")
 
-        shutil.move(spray_output["excel_file"], spray_excel_dest)
-        log(f"已移动Spray处理后Excel: {spray_excel_dest}")
+        if spray_output.get("excel_file") and os.path.exists(spray_output["excel_file"]):
+            spray_excel_base = f"spray_processed_{datetime.datetime.now().strftime('%Y%m%d')}"
+            spray_excel_dest = generate_unique_filename(full_date_dir, spray_excel_base, ".xlsx")
+            shutil.move(spray_output["excel_file"], spray_excel_dest)
+            log(f"已移动Spray处理后Excel: {spray_excel_dest}")
 
-        spray_txt_source = spray_output["txt_file"]
-        if os.path.exists(spray_txt_source):
+        spray_txt_source = spray_output.get("txt_file")
+        if spray_txt_source and os.path.exists(spray_txt_source):
             spray_txt_base = f"spray_urls_{datetime.datetime.now().strftime('%Y%m%d')}"
             spray_txt_dest = generate_unique_filename(full_date_dir, spray_txt_base, ".txt")
             shutil.move(spray_txt_source, spray_txt_dest)
             log(f"已移动Spray提取URL列表: {spray_txt_dest}")
 
         if not filter_result.get("has_results"):
-            log(f"自动化流程完成：Spray阶段已完成，但未发现状态码200的URL，已跳过 Web-SurvivalScan。结果保存在: {full_date_dir}")
+            if spray_output.get("is_empty"):
+                log(f"自动化流程完成：Spray阶段未命中任何结果，已跳过 Web-SurvivalScan。结果保存在: {full_date_dir}")
+            else:
+                log(f"自动化流程完成：Spray阶段已完成，但未发现状态码200的URL，已跳过 Web-SurvivalScan。结果保存在: {full_date_dir}")
             return
 
         if not filtered_txt_path or not os.path.exists(filtered_txt_path) or os.path.getsize(filtered_txt_path) == 0:
